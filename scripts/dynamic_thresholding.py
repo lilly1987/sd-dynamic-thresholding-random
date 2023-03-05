@@ -14,33 +14,43 @@ import gradio as gr
 import torch
 import math
 from modules import scripts, sd_samplers, sd_samplers_kdiffusion, sd_samplers_common
+import random
 
 ######################### Data values #########################
 VALID_MODES = ["Constant", "Linear Down", "Cosine Down", "Half Cosine Down", "Linear Up", "Cosine Up", "Half Cosine Up", "Power Up"]
 
 ######################### Script class entrypoint #########################
+
+def rnd(x,y,z):
+    return random.randint(0, int((max(x,y) - min(x,y)) * z)) / z + min(x,y)
+    
 class Script(scripts.Script):
 
     def title(self):
-        return "Dynamic Thresholding (CFG Scale Fix)"
+        return "Dynamic Thresholding (CFG Scale Fix) Random"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        enabled = gr.Checkbox(value=False, label="Enable Dynamic Thresholding (CFG Scale Fix)")
+        enabled = gr.Checkbox(value=False, label="Enable Dynamic Thresholding (CFG Scale Fix) random")
         # "Dynamic Thresholding (CFG Scale Fix)"
         accordion = gr.Group(visible=False)
         with accordion:
             gr.HTML(value=f"<br>View <a style=\"border-bottom: 1px #00ffff dotted;\" href=\"https://github.com/mcmonkeyprojects/sd-dynamic-thresholding/wiki/Usage-Tips\">the wiki for usage tips.</a><br><br>")
-            mimic_scale = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Mimic CFG Scale', value=7.0)
+            mimic_scale     = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Mimic CFG Scale. min', value=5.0)
+            mimic_scale_rnd = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Mimic CFG Scale. max', value=9.0)
             with gr.Accordion("Dynamic Thresholding Advanced Options", open=False):
-                threshold_percentile = gr.Slider(minimum=90.0, value=100.0, maximum=100.0, step=0.05, label='Top percentile of latents to clamp')
+                threshold_percentile     = gr.Slider(minimum=90.0, value=90.0, maximum=100.0, step=0.05, label='Top percentile of latents to clamp. min')
+                threshold_percentile_max = gr.Slider(minimum=90.0, value=100.0, maximum=100.0, step=0.05, label='Top percentile of latents to clamp. max')
                 mimic_mode = gr.Dropdown(VALID_MODES, value="Constant", label="Mimic Scale Scheduler")
-                mimic_scale_min = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, label="Minimum value of the Mimic Scale Scheduler")
+                mimic_scale_min     = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, value=0.0 , label="Minimum value of the Mimic Scale Scheduler. min")
+                mimic_scale_min_rnd = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, value=30.0, label="Minimum value of the Mimic Scale Scheduler. max")
                 cfg_mode = gr.Dropdown(VALID_MODES, value="Constant", label="CFG Scale Scheduler")
-                cfg_scale_min = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, label="Minimum value of the CFG Scale Scheduler")
-                power_val = gr.Slider(minimum=0.0, maximum=15.0, step=0.5, value=4.0, label="Power Scheduler Value")
+                cfg_scale_min = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, value=0.0 , label="Minimum value of the CFG Scale Scheduler. min")
+                cfg_scale_rnd = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, value=30.0, label="Minimum value of the CFG Scale Scheduler. max")
+                power_val     = gr.Slider(minimum=0.0, maximum=15.0, step=0.5, value=0.0, label="Power Scheduler Value. min")
+                power_val_rnd = gr.Slider(minimum=0.0, maximum=15.0, step=0.5, value=15.0, label="Power Scheduler Value. max")
         enabled.change(
             fn=lambda x: {"visible": x, "__type__": "update"},
             inputs=[enabled],
@@ -56,24 +66,51 @@ class Script(scripts.Script):
             (cfg_mode, "CFG mode"),
             (cfg_scale_min, "CFG scale minimum"),
             (power_val, "Power scheduler value"))
-        return [enabled, mimic_scale, threshold_percentile, mimic_mode, mimic_scale_min, cfg_mode, cfg_scale_min, power_val]
+        return [enabled, mimic_scale, threshold_percentile, mimic_mode, mimic_scale_min, cfg_mode, cfg_scale_min, power_val
+            ,mimic_scale_rnd
+            ,threshold_percentile_max
+            ,mimic_scale_min_rnd
+            ,cfg_scale_rnd
+            ,power_val_rnd
+        ]
 
     last_id = 0
 
-    def process_batch(self, p, enabled, mimic_scale, threshold_percentile, mimic_mode, mimic_scale_min, cfg_mode, cfg_scale_min, powerscale_power, batch_number, prompts, seeds, subseeds):
+    def process_batch(self, p, enabled, mimic_scale, threshold_percentile, mimic_mode, mimic_scale_min, cfg_mode, cfg_scale_min, powerscale_power
+        ,mimic_scale_rnd
+        ,threshold_percentile_max
+        ,mimic_scale_min_rnd
+        ,cfg_scale_rnd
+        ,power_val_rnd
+        , batch_number, prompts, seeds, subseeds
+    ):
         enabled = getattr(p, 'dynthres_enabled', enabled)
         if not enabled:
             return
         if p.sampler_name in ["DDIM", "PLMS"]:
             raise RuntimeError(f"Cannot use sampler {p.sampler_name} with Dynamic Thresholding")
         mimic_scale = getattr(p, 'dynthres_mimic_scale', mimic_scale)
+        mimic_scale_rnd = getattr(p, 'dynthres_mimic_scale', mimic_scale_rnd)
         threshold_percentile = getattr(p, 'dynthres_threshold_percentile', threshold_percentile)
+        threshold_percentile_max = getattr(p, 'dynthres_threshold_percentile', threshold_percentile_max)
         mimic_mode = getattr(p, 'dynthres_mimic_mode', mimic_mode)
         mimic_scale_min = getattr(p, 'dynthres_mimic_scale_min', mimic_scale_min)
+        mimic_scale_min_rnd = getattr(p, 'dynthres_mimic_scale_min', mimic_scale_min_rnd)
         cfg_mode = getattr(p, 'dynthres_cfg_mode', cfg_mode)
         cfg_scale_min = getattr(p, 'dynthres_cfg_scale_min', cfg_scale_min)
+        cfg_scale_rnd = getattr(p, 'dynthres_cfg_scale_min', cfg_scale_rnd)
         experiment_mode = getattr(p, 'dynthres_experiment_mode', 0)
         power_val = getattr(p, 'dynthres_power_val', powerscale_power)
+        power_val_rnd = getattr(p, 'dynthres_power_val', power_val_rnd)
+        
+        mimic_scale=rnd(mimic_scale,mimic_scale_rnd,2)
+        #threshold_percentile=random.uniform(min(threshold_percentile,threshold_percentile_max),max(threshold_percentile,threshold_percentile_max))
+        threshold_percentile=rnd(threshold_percentile,threshold_percentile_max,20)
+        mimic_scale_min=rnd(mimic_scale_min,mimic_scale_min_rnd,2)
+        cfg_scale_min=rnd(cfg_scale_min,cfg_scale_rnd,2)
+        power_val=rnd(power_val,power_val_rnd,2)
+        
+        
         p.extra_generation_params["Dynamic thresholding enabled"] = True
         p.extra_generation_params["Mimic scale"] = mimic_scale
         p.extra_generation_params["Threshold percentile"] = threshold_percentile
@@ -106,7 +143,13 @@ class Script(scripts.Script):
         if p.sampler is not None:
             p.sampler = sd_samplers.create_sampler(fixed_sampler_name, p.sd_model)
 
-    def postprocess_batch(self, p, enabled, mimic_scale, threshold_percentile, mimic_mode, mimic_scale_min, cfg_mode, cfg_scale_min, powerscale_power, batch_number, images):
+    def postprocess_batch(self, p, enabled, mimic_scale, threshold_percentile, mimic_mode, mimic_scale_min, cfg_mode, cfg_scale_min, powerscale_power
+        ,mimic_scale_rnd
+        ,threshold_percentile_max
+        ,mimic_scale_min_rnd
+        ,cfg_scale_rnd
+        ,power_val_rnd    
+        , batch_number, images):
         if not enabled or not hasattr(p, 'orig_sampler_name'):
             return
         p.sampler_name = p.orig_sampler_name
